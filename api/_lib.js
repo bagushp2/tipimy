@@ -41,31 +41,63 @@ function abs(u, base) {
 }
 
 /* ---------- Ekstraksi ---------- */
+function decodeEntities(s) {
+  return s.replace(/&(amp|quot|apos|#0*38|#0*34|#0*39|#x2f|#0*47);/gi, (m, g) => {
+    g = g.toLowerCase();
+    if (g === 'amp' || /^#0*38$/.test(g)) return '&';
+    if (g === 'quot' || /^#0*34$/.test(g)) return '"';
+    if (g === 'apos' || /^#0*39$/.test(g)) return "'";
+    return '/';
+  });
+}
 function unescapeText(s) {
-  return s.replace(/\\u0026/gi, '&').replace(/&amp;/g, '&').replace(/\\\//g, '/');
+  return decodeEntities(s).replace(/\\u0026/gi, '&').replace(/\\u002f/gi, '/').replace(/\\\//g, '/');
 }
 
 function findM3u8(text, base) {
   const t = unescapeText(text);
   const out = new Set();
-  // absolut / protocol-relative
   for (const m of t.matchAll(/(?:https?:)?\/\/[^\s"'<>\\()]+?\.m3u8(?:\?[^\s"'<>\\()]*)?/gi)) {
     const u = abs(m[0], base);
     if (u) out.add(u);
   }
-  // relatif: "/live/x.m3u8"
   for (const m of t.matchAll(/["'(]((?:\.{0,2}\/)[^\s"'<>\\()]+?\.m3u8(?:\?[^\s"'<>\\()]*)?)["')]/gi)) {
     const u = abs(m[1], base);
     if (u) out.add(u);
   }
-  // percent-encoded (biasanya di query iframe: ?url=https%3A%2F%2F...m3u8)
   for (const m of t.matchAll(/https?%3A%2F%2F[^\s"'<>\\&]+?\.m3u8[^\s"'<>\\&]*/gi)) {
     try { out.add(decodeURIComponent(m[0])); } catch {}
   }
   return [...out];
 }
 
-// string base64 panjang (atob("...") dsb) -> teks hasil decode, untuk di-scan juga
+// <video src> / <source src> : kandidat apa pun ekstensinya
+function mediaSrc(text, base) {
+  const out = new Set();
+  for (const m of text.matchAll(/<(?:video|source)\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']/gi)) {
+    const u = abs(decodeEntities(m[1]), base);
+    if (u && /^https?:/i.test(u)) out.add(u);
+  }
+  return [...out];
+}
+
+// URL "mencurigakan" (path mengandung stream/hls/playlist/proxy...) -> dicek isinya (#EXTM3U), bukan ekstensinya
+const SOFT_KW = /stream|hls|playlist|manifest|\/live|proxy|\/play|channel/i;
+const STATIC_RE =
+  /\.(?:js|css|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|map|json|xml)(?:\?|$)|wp-content\/(?:plugins|themes|uploads)|wp-includes|oembed|xmlrpc|googleapis|gstatic|unpkg|jsdelivr|schema\.org|w\.org|facebook|twitter|google|statcounter|gravatar/i;
+function softCandidates(text, base) {
+  const t = unescapeText(text);
+  const out = new Set();
+  const add = (raw) => {
+    const u = abs(raw, base);
+    if (u && /^https?:/i.test(u) && SOFT_KW.test(u) && !STATIC_RE.test(u)) out.add(u);
+  };
+  for (const m of t.matchAll(/(?:https?:)?\/\/[^\s"'<>\\()]+/g)) add(m[0]);
+  for (const m of t.matchAll(/["'=](\/[A-Za-z0-9_\-.~%/]+(?:\?[^\s"'<>\\()]*)?)["']/g)) add(m[1]);
+  return [...out].slice(0, 12);
+}
+
+// string base64 panjang (atob("...") dsb) -> teks hasil decode
 function blobs(text) {
   let extra = '';
   let n = 0;
@@ -83,26 +115,99 @@ const FRAME_SKIP = /googletagmanager|doubleclick|facebook\.com|statcounter|googl
 function frames(text, base) {
   const out = new Set();
   for (const m of text.matchAll(/<iframe\b[^>]*?\b(?:data-lazy-src|data-src|src)\s*=\s*["']([^"']+)["']/gi)) {
-    const u = abs(m[1].replace(/&amp;/g, '&'), base);
+    const u = abs(decodeEntities(m[1]), base);
     if (u && /^https?:/i.test(u) && !FRAME_SKIP.test(u)) out.add(u);
   }
   return [...out];
 }
 
 const SCRIPT_SKIP =
-  /jquery|googletagmanager|google-analytics|gtag|statcounter|wp-includes|wp-emoji|cloudflare|recaptcha|adsbygoogle|facebook|bootstrap|fontawesome|gstatic|googleapis/i;
+  /jquery|googletagmanager|google-analytics|gtag|statcounter|wp-includes|wp-emoji|cloudflare|recaptcha|adsbygoogle|facebook|bootstrap|fontawesome|gstatic|googleapis|unpkg|jsdelivr|video\.min|googlesitekit|\/themes\//i;
+const SCRIPT_PREF = /player|stream|proxy|video|init|hls/i;
 function scripts(text, base) {
   const out = new Set();
   for (const m of text.matchAll(/<script\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']/gi)) {
-    const u = abs(m[1].replace(/&amp;/g, '&'), base);
+    const u = abs(decodeEntities(m[1]), base);
     if (u && /^https?:/i.test(u) && !SCRIPT_SKIP.test(u)) out.add(u);
   }
-  return [...out];
+  return [...out].sort((a, b) => SCRIPT_PREF.test(b) - SCRIPT_PREF.test(a));
+}
+
+// ---- petunjuk untuk diagnosa (masuk ke log debug) ----
+const squash = (s, n) => s.replace(/\s+/g, ' ').trim().slice(0, n);
+function hints(text) {
+  const attrs = [];
+  for (const m of text.matchAll(/\bdata-([a-z0-9_-]+)\s*=\s*"([^"]{6,500})"/gi)) {
+    if (/stream|src|url|source|hls|m3u8|proxy|token|sig|channel|player|config|video|manifest|play/i.test(m[1]))
+      attrs.push(`${m[1]}=${squash(decodeEntities(m[2]), 220)}`);
+    if (attrs.length >= 10) break;
+  }
+  const inline = [];
+  for (const m of text.matchAll(/<script\b(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)) {
+    if (/player|stream|proxy|sig|hls|m3u8|token/i.test(m[1]) && !/googletag|gtag|sitekit/i.test(m[1]))
+      inline.push(squash(m[1], 500));
+    if (inline.length >= 3) break;
+  }
+  return { attrs, inline };
+}
+
+function endpointsFromScript(text) {
+  const out = new Set();
+  const add = (u) => { if (u && !/\$\{/.test(u)) { const a = abs(u, SITE + '/'); if (a) out.add(a); } };
+  for (const m of text.matchAll(/["'`]((?:https?:\/\/[^"'`\s]+)?\/wp-json\/[^"'`\s]+)["'`]/g)) add(m[1]);
+  for (const m of text.matchAll(/fetch\(\s*["'`]([^"'`]+)["'`]/g)) add(m[1]);
+  for (const m of text.matchAll(/\.open\(\s*["'][A-Za-z]+["']\s*,\s*["'`]([^"'`]+)["'`]/g)) add(m[1]);
+  const actions = [...text.matchAll(/action\s*[:=]\s*["']([\w-]+)["']/g)].map((m) => m[1]);
+  return { urls: [...out].filter((u) => !STATIC_RE.test(u) || /wp-json/.test(u)).slice(0, 5), actions: [...new Set(actions)].slice(0, 3) };
+}
+
+async function head(r, n = 400) {
+  const rd = r.body.getReader();
+  let buf = Buffer.alloc(0);
+  try {
+    while (buf.length < n) {
+      const { value, done } = await rd.read();
+      if (done) break;
+      buf = Buffer.concat([buf, Buffer.from(value)]);
+    }
+  } finally {
+    try { await rd.cancel(); } catch {}
+  }
+  return buf.toString('utf8', 0, n);
 }
 
 async function discover(slug, log) {
   const found = [];
+  const soft = new Set();
   const seen = new Set();
+  const pageUrl = `${SITE}/${slug}/`;
+
+  const take = (text, base, from, referer) => {
+    const all = text + blobs(text);
+    findM3u8(all, base).forEach((u) => found.push({ url: u, from, referer }));
+    mediaSrc(all, base).forEach((u) => soft.add(u));
+    softCandidates(all, base).forEach((u) => soft.add(u));
+  };
+
+  // kandidat "mencurigakan" (tanpa ekstensi .m3u8) -> cek isinya (#EXTM3U)
+  const sniffSoft = async () => {
+    if (found.length || !soft.size) return;
+    const list = [...soft].slice(0, 12);
+    soft.clear();
+    await Promise.all(
+      list.map(async (u) => {
+        try {
+          const r = await get(u, pageUrl, 6000);
+          const h = r.ok ? await head(r, 300) : '';
+          const ok = h.includes('#EXTM3U');
+          log.push({ step: 'soft', url: u, status: r.status, ok });
+          if (ok) found.push({ url: u, from: pageUrl, referer: pageUrl });
+        } catch (e) {
+          log.push({ step: 'soft', url: u, error: String(e.message || e) });
+        }
+      })
+    );
+  };
 
   const visit = async (url, ref, depth) => {
     if (seen.has(url) || seen.size >= 14 || depth > 3) return;
@@ -119,11 +224,12 @@ async function discover(slug, log) {
     const all = text + blobs(text);
     const fr = frames(all, base);
     const sc = scripts(all, base);
-    log.push({ step: 'fetch', url, status: r.status, bytes: text.length, frames: fr, scripts: sc.slice(0, 8) });
+    log.push({ step: 'fetch', url, status: r.status, bytes: text.length, frames: fr, scripts: sc, hints: hints(text) });
     if (!r.ok) return;
 
-    const direct = findM3u8(all, base);
-    direct.forEach((u) => found.push({ url: u, from: url, referer: ref }));
+    take(text, base, url, ref);
+    if (found.length) return;
+    await sniffSoft();
     if (found.length) return;
 
     for (const f of fr) {
@@ -133,17 +239,39 @@ async function discover(slug, log) {
       if (found.length) return;
     }
 
-    for (const s of sc.slice(0, 4)) {
+    for (const s of sc.slice(0, 5)) {
       try {
         const sr = await get(s, url);
         const st = await sr.text();
-        findM3u8(st + blobs(st), s).forEach((u) => found.push({ url: u, from: s, referer: url }));
+        const ep = endpointsFromScript(st);
+        log.push({ step: 'script', url: s, status: sr.status, bytes: st.length, head: squash(st, 1200), endpoints: ep.urls, actions: ep.actions });
+        take(st, s, s, url);
         if (found.length) return;
-      } catch {}
+        // endpoint yang tertulis langsung di script (REST / ajax)
+        const eps = [...ep.urls];
+        for (const a of ep.actions)
+          eps.push(`${SITE}/wp-admin/admin-ajax.php?action=${a}&channel=${slug}&slug=${slug}&id=${slug}`);
+        for (const e of eps.slice(0, 6)) {
+          try {
+            const er = await get(e, url, 6000);
+            const et = (await head(er, 4000)) || '';
+            log.push({ step: 'endpoint', url: e, status: er.status, type: er.headers.get('content-type'), head: squash(et, 300) });
+            if (er.ok) take(et, e, url, url);
+            if (found.length) return;
+          } catch (err) {
+            log.push({ step: 'endpoint', url: e, error: String(err.message || err) });
+          }
+        }
+      } catch (e) {
+        log.push({ step: 'script', url: s, error: String(e.message || e) });
+      }
     }
   };
 
-  await visit(`${SITE}/${slug}/`, SITE + '/', 0);
+  await visit(pageUrl, SITE + '/', 0);
+
+  await sniffSoft();
+
   const uniq = new Map();
   found.forEach((f) => { if (!uniq.has(f.url)) uniq.set(f.url, f); });
   return [...uniq.values()];
@@ -153,7 +281,7 @@ async function probe(url, refs, log) {
   for (const ref of refs) {
     try {
       const r = await get(url, ref, 7000);
-      const body = r.ok ? (await r.text()).slice(0, 300) : '';
+      const body = r.ok ? await head(r, 300) : '';
       const ok = r.ok && body.includes('#EXTM3U');
       log.push({ step: 'probe', url, referer: ref, status: r.status, ok });
       if (ok) return { ok: true, ref };
@@ -179,7 +307,7 @@ async function resolve(slug, { force = false, log = [] } = {}) {
     throw err;
   }
   for (const cand of cands) {
-    const refs = [...new Set([cand.from, cand.referer, SITE + '/', null])];
+    const refs = [...new Set([SITE + '/', cand.from, cand.referer, null])];
     const p = await probe(cand.url, refs, log);
     if (p.ok) {
       const v = { url: cand.url, referer: p.ref, verified: true, exp: Date.now() + TTL };
@@ -193,6 +321,27 @@ async function resolve(slug, { force = false, log = [] } = {}) {
   const v = { url: c0.url, referer: c0.from, verified: false, exp: Date.now() + 15000 };
   cache.set(slug, v);
   return v;
+}
+
+// Ambil manifest channel; kalau upstream menolak (token kedaluwarsa) resolve ulang sekali.
+async function manifestFor(slug) {
+  let lastErr = 'tidak diketahui';
+  for (let i = 0; i < 2; i++) {
+    const hit = await resolve(slug, { force: i === 1 });
+    try {
+      const r = await get(hit.url, hit.referer, 10000);
+      if (r.ok) {
+        const text = await r.text();
+        if (text.includes('#EXTM3U')) return { text, base: r.url || hit.url, referer: hit.referer };
+        lastErr = 'isi bukan playlist HLS';
+      } else {
+        lastErr = 'upstream ' + r.status;
+      }
+    } catch (e) {
+      lastErr = String(e.message || e);
+    }
+  }
+  throw new Error('manifest gagal diambil: ' + lastErr);
 }
 
 /* ---------- Token bertanda tangan untuk /api/p ---------- */
@@ -238,5 +387,5 @@ function rewriteManifest(text, base, ref, host) {
 }
 
 module.exports = {
-  SITE, CHANNELS, get, abs, findM3u8, blobs, frames, resolve, sign, verify, origin, rewriteManifest,
+  SITE, CHANNELS, get, abs, findM3u8, blobs, frames, resolve, manifestFor, sign, verify, origin, rewriteManifest,
 };
