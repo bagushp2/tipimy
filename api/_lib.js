@@ -300,6 +300,7 @@ const PROVIDERS = {
   alhijrah: 'mana2-my', bernama: 'mana2-my',
   tv3: 'tonton', '8tv': 'tonton', tv9: 'tonton', didiktv: 'tonton',
 };
+const CODES = { okey: 'tv-okey', didiktv: 'didik', alhijrah: 'tv-alhijrah' };
 const FALLBACK_P = [
   'mana2-my', 'tonton', 'alhijrah', 'tv-alhijrah', 'bernama', 'bernama-tv', 'astro', 'rtm', 'mytv', 'unifi', 'mediaprima',
 ];
@@ -348,7 +349,7 @@ function providerHints(text) {
 async function fetchBootstrap(slug, p) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 6000);
-  const url = `${SITE}/wp-json/media-hub/v1/bootstrap?v=${encodeURIComponent(makeV(p, slug))}`;
+  const url = `${SITE}/wp-json/media-hub/v1/bootstrap?v=${encodeURIComponent(makeV(p, CODES[slug] || slug))}`;
   try {
     return await fetch(url, {
       signal: ctrl.signal,
