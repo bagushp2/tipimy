@@ -3,7 +3,7 @@ const crypto = require('crypto');
 
 const SITE = (process.env.SITE_URL || 'https://tvmalaysia.com.co').replace(/\/+$/, '');
 const UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36 Edg/155.0.0.0';
 
 // slug di tvmalaysia.com.co  ->  nama channel
 const CHANNELS = {
@@ -292,33 +292,167 @@ async function probe(url, refs, log) {
   return { ok: false };
 }
 
+/* ---------- Adapter tvmalaysia.com.co: /wp-json/media-hub/v1/bootstrap ---------- */
+// Request : v = base64(base64(base64({"p":provider,"c":channel,"q":"main","e":"1800s","n":"<ms>-<8 digit>"})))
+// Respons : "<base64 x3>"  ->  {"url":"https://...b-cdn.net/streamer/xxx.m3u8?expires=..&token=..","expires_at":..}
+const PROVIDERS = {
+  tv1: 'mana2-my', tv2: 'mana2-my', okey: 'mana2-my', 'sukan-rtm': 'mana2-my', 'berita-rtm': 'mana2-my',
+  alhijrah: 'mana2-my', bernama: 'mana2-my',
+  tv3: 'tonton', '8tv': 'tonton', tv9: 'tonton', didiktv: 'tonton',
+};
+const FALLBACK_P = [
+  'mana2-my', 'tonton', 'alhijrah', 'tv-alhijrah', 'bernama', 'bernama-tv', 'astro', 'rtm', 'mytv', 'unifi', 'mediaprima',
+];
+
+const b64 = (s) => Buffer.from(s).toString('base64');
+function makeV(p, c) {
+  const n = `${Date.now()}-${Math.floor(1e7 + Math.random() * 9e7)}`;
+  return b64(b64(b64(JSON.stringify({ p, c, q: 'main', e: '1800s', n }))));
+}
+
+// buka lapisan base64 sampai ketemu JSON
+function unwrap(text) {
+  let cur = String(text).trim();
+  try {
+    const j = JSON.parse(cur);
+    if (typeof j !== 'string') return j;
+    cur = j;
+  } catch {}
+  for (let i = 0; i < 5; i++) {
+    cur = cur.trim();
+    if (cur.startsWith('{') || cur.startsWith('[')) {
+      try { return JSON.parse(cur); } catch { return null; }
+    }
+    cur = Buffer.from(cur, 'base64').toString('utf8');
+  }
+  return null;
+}
+
+// cari nama provider yang tertulis di halaman (atribut data-*, "p":"...", atau blob base64 berlapis)
+function providerHints(text) {
+  const out = new Set();
+  const t = unescapeText(text);
+  for (const m of t.matchAll(/["']p["']\s*:\s*["']([a-z0-9][a-z0-9_-]{2,30})["']/gi)) out.add(m[1]);
+  for (const m of text.matchAll(/\bdata-(?:provider|platform|source|p)\s*=\s*["']([a-z0-9][a-z0-9_-]{2,30})["']/gi)) out.add(m[1]);
+  let n = 0;
+  for (const m of text.matchAll(/["'=]([A-Za-z0-9+/]{60,}={0,2})["']/g)) {
+    if (++n > 100) break;
+    try {
+      const o = unwrap(m[1]);
+      if (o && typeof o.p === 'string') out.add(o.p);
+    } catch {}
+  }
+  return [...out];
+}
+
+async function fetchBootstrap(slug, p) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 6000);
+  const url = `${SITE}/wp-json/media-hub/v1/bootstrap?v=${encodeURIComponent(makeV(p, slug))}`;
+  try {
+    return await fetch(url, {
+      signal: ctrl.signal,
+      headers: {
+        'User-Agent': UA,
+        Accept: 'text/plain, application/json',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        Pragma: 'no-cache',
+        Referer: `${SITE}/${slug}/`,
+        'Sec-Ch-Ua': '"Microsoft Edge";v="155", "Chromium";v="155", "Not(A:Brand";v="24"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
+      },
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function bootstrapResolve(slug, log, forced) {
+  const pageUrl = `${SITE}/${slug}/`;
+  const t0 = Date.now();
+  const tried = new Set();
+  let firstUnverified = null;
+
+  async function* groups() {
+    if (forced) { yield [forced]; return; }
+    if (PROVIDERS[slug]) yield [PROVIDERS[slug]];
+    try {
+      const r = await get(pageUrl, SITE + '/');
+      const hs = providerHints(await r.text());
+      log.push({ step: 'provider-hints', hints: hs });
+      yield hs;
+    } catch (e) {
+      log.push({ step: 'provider-hints', error: String(e.message || e) });
+    }
+    yield FALLBACK_P;
+  }
+
+  for await (const group of groups()) {
+    for (const p of group) {
+      if (tried.has(p) || Date.now() - t0 > 20000) continue;
+      tried.add(p);
+      let got = null;
+      try {
+        const r = await fetchBootstrap(slug, p);
+        const text = await r.text();
+        const obj = r.ok ? unwrap(text) : null;
+        const ok = !!(obj && typeof obj.url === 'string');
+        log.push({ step: 'bootstrap', p, status: r.status, ok, ...(ok ? { expires_in: obj.expires_in } : { head: squash(text, 200) }) });
+        if (ok) got = obj;
+      } catch (e) {
+        log.push({ step: 'bootstrap', p, error: String(e.message || e) });
+      }
+      if (!got) continue;
+      const refs = [SITE + '/', pageUrl, null];
+      const pr = await probe(got.url, refs, log);
+      const exp = Math.min(Date.now() + 10 * 60 * 1000, (got.expires_at ? got.expires_at * 1000 : Infinity) - 2 * 60 * 1000);
+      if (pr.ok) return { url: got.url, referer: pr.ref, verified: true, provider: p, exp };
+      if (!firstUnverified) firstUnverified = { url: got.url, referer: SITE + '/', verified: false, provider: p, exp: Date.now() + 15000 };
+    }
+  }
+  return firstUnverified;
+}
+
 /* ---------- Resolve + cache (per instance, singkat) ---------- */
 const cache = new Map();
 const TTL = 60 * 1000;
 
-async function resolve(slug, { force = false, log = [] } = {}) {
-  const c = cache.get(slug);
-  if (!force && c && c.exp > Date.now()) return c;
-
+async function resolveGeneric(slug, log) {
   const cands = await discover(slug, log);
   if (!cands.length) {
-    const err = new Error('URL m3u8 tidak ditemukan di halaman / iframe / script');
+    const err = new Error('URL m3u8 tidak ditemukan (adapter bootstrap & pencarian umum gagal)');
     err.log = log;
     throw err;
   }
   for (const cand of cands) {
     const refs = [...new Set([SITE + '/', cand.from, cand.referer, null])];
     const p = await probe(cand.url, refs, log);
-    if (p.ok) {
-      const v = { url: cand.url, referer: p.ref, verified: true, exp: Date.now() + TTL };
-      cache.set(slug, v);
-      return v;
-    }
+    if (p.ok) return { url: cand.url, referer: p.ref, verified: true, exp: Date.now() + TTL };
   }
   // Tidak ada yang lolos probe dari server Vercel (mis. token terikat IP / geo-block).
-  // Tetap kembalikan kandidat pertama; mungkin tetap jalan dari IP pemirsa.
   const c0 = cands[0];
-  const v = { url: c0.url, referer: c0.from, verified: false, exp: Date.now() + 15000 };
+  return { url: c0.url, referer: c0.from, verified: false, exp: Date.now() + 15000 };
+}
+
+async function resolve(slug, { force = false, log = [], p } = {}) {
+  const c = cache.get(slug);
+  if (!force && c && c.exp > Date.now()) return c;
+
+  let v = await bootstrapResolve(slug, log, p);
+  if (!v || !v.verified) {
+    // adapter gagal / tidak terverifikasi -> coba pencarian umum, ambil yang terverifikasi kalau ada
+    try {
+      const g = await resolveGeneric(slug, log);
+      if (!v || g.verified) v = g;
+    } catch (e) {
+      if (!v) throw e;
+    }
+  }
   cache.set(slug, v);
   return v;
 }
