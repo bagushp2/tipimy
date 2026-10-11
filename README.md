@@ -1,6 +1,6 @@
-# TV Malaysia Resolver (Vercel)
+# TV Resolver (Vercel)
 
-Link permanen `.m3u8` untuk VLC dari halaman tvmalaysia.com.co.
+Link permanen `.m3u8` untuk VLC
 
 ## Deploy
 1. Taruh folder ini di repo GitHub, import ke Vercel (atau `vercel --prod` dari folder ini).
