@@ -1,0 +1,9 @@
+{
+  "regions": ["sin1"],
+  "functions": { "api/*.js": { "maxDuration": 30 } },
+  "rewrites": [
+    { "source": "/", "destination": "/api/index" },
+    { "source": "/playlist.m3u", "destination": "/api/playlist" },
+    { "source": "/:ch.m3u8", "destination": "/api/stream?ch=:ch" }
+  ]
+}
