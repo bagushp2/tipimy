@@ -12,4 +12,4 @@ Link permanen `.m3u8` untuk VLC
 - Semua channel: `https://<project>.vercel.app/playlist.m3u`
 - Mode proxy   : tambahkan `?proxy=1` (butuh SIGN_KEY)
 
-Slug: tv1, tv2, tv3, didiktv, 8tv, tv9, alhijrah, okey, sukan-rtm, berita-rtm, bernama
+
